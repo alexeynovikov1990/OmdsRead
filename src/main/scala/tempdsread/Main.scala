@@ -7,7 +7,7 @@ import fastwalker.FastDirEnumerator
 import fswalker.SystemSettings
 import fswalker._
 import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{Row, SaveMode}
 import org.apache.spark.sql.functions.{collect_list, concat_ws}
 import simplewalker._
 
@@ -181,15 +181,41 @@ object Main {
     ).show()
   }
 
+  def sqlGroupTest() : Unit = {
+    val data1 = Seq(
+      Row(1,	"1993", "", "", "1984"),
+      Row(1,	"",	"Ivan", "",	""),
+      Row(1,	"",	"", "Petrov",		"")
+    )
+    val schema1 = StructType( Array(
+      StructField("id", IntegerType,true),
+      StructField("registeryear", StringType, true),
+      StructField("name", StringType, true),
+      StructField("surname", StringType, true),
+      StructField("bornyear", StringType, true)
+    ))
+    val df1 = Spark.spark.createDataFrame(Spark.spark.sparkContext.parallelize(data1), schema1)
+    df1.registerTempTable("data")
+    val sqlQuery = "select id,concat_ws(' ', collect_list(registeryear)) as registeryear, concat_ws(' ', collect_list(name)),concat_ws(' ', collect_list(surname)),concat_ws(' ', collect_list(bornyear)) from data group by id"
+    df1.sqlContext.sql(sqlQuery).show()
+  }
+
+  def printParquetTest() : Unit = {
+    val input = "/home/test/testdata/_time_range=1572555600000-1572642000000/_year=2019/_month=11/_day=01/_department_num=4/_deposit=tailakovskoe/_pad_num=1/_object=скважина_73/"
+    val df = Spark.spark.read.parquet(input)
+    df.show(100)
+  }
+
   def main(args: Array[String]): Unit = {
 
     SystemSettings.Init()
 
-    val omdsReadCmdline = "ds=tds actual_time=true address=_time_range#1572555600000-1572642000000/_year#2019/**/_department_num#4/ field=well_num op=# value=655 metrics=address#pad_num#deposit#_time_preprocess"
+    val omdsReadCmdline = "ds=tds actual_time=false address=_time_range#1572555600000-1572642000000/_year#2019/**/_department_num#4/ field=well_num op=# value=73 metrics=address#pad_num#deposit#_time_preprocess"
     val omdsread: OmdsRead = new OmdsRead(SimpleQuery(omdsReadCmdline), new MockPluginUtils(Spark.spark))
     val df = omdsread.transform(Spark.spark.emptyDataFrame)
     df.show()
 
+    //sqlGroupTest()
     //aggTest()
     //val tds:String = "/home/test/smalldata/"
     //val addr1 = "_time_range=1572555600000-1572642000000/_year=2019/**/_department_num=4/"

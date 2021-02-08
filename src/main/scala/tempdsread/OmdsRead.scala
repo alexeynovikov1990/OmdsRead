@@ -28,10 +28,10 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
     var result = _df
     val input = readData(tdsPath, address)
     val aggInput = aggByName(input, "_time")
-    if (aggInput != Spark.spark.emptyDataFrame){
+    if (aggInput.count() > 0){
       if (!field.isEmpty && !operation.isEmpty && !value.isEmpty){
         var filteredFrame = filterData(aggInput, field, operation, value)
-        if (filteredFrame != Spark.spark.emptyDataFrame){
+        if (filteredFrame.count() > 0){
           if (actualTime)
             filteredFrame = updateTime(filteredFrame)
           result = addPartitionsColumns(filteredFrame.select("_time", metrics: _*))
