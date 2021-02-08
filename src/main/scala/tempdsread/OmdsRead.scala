@@ -114,16 +114,26 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
   }
 
   def aggByName(df:DataFrame, name:String) : DataFrame = {
-    /*val columns = new ArrayBuffer[Column]()
+    val columns = new ArrayBuffer[String]()
     val colNames = df.columns
     for (n <- colNames){
       if (!n.equals(name))
-        columns += col(n)
+        columns += n
     }
-    df.groupBy(name).agg(
-      concat_ws(" ", collect_list("deposit")) as "deposit"
-    )*/
-    df
+    //Агрегирующий sql-запрос
+    val aggQuery = new StringBuilder()
+    aggQuery.append("select _time, ")
+    for (name <- columns){
+      aggQuery.append("concat_ws(' ', collect_list(")
+      aggQuery.append(name)
+      aggQuery.append(")) as ")
+      aggQuery.append(name)
+      aggQuery.append(",")
+    }
+    aggQuery.deleteCharAt(aggQuery.size - 1)
+    aggQuery.append(" from data group by _time")
+    df.registerTempTable("data")
+    df.sqlContext.sql(aggQuery.toString())
   }
 
   def filterData(frame:DataFrame, field:String, op:String, value:String) : DataFrame = {
