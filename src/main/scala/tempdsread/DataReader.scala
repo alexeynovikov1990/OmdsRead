@@ -6,9 +6,35 @@ import org.apache.spark.sql.types.{StructField, StructType}
 
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
-import java.util.IdentityHashMap
 import java.nio.file.Files
 import java.nio.file.Paths
+
+/*
+Алгоритм:
+Вход: отображение objid - набор полей объекта
+Выход: 2 набора полей для каждого objid. В одном находится список полей, которые нужно переименовать, в другом - которые нужно добавить.
+
+Под операциями суммы и пересечения наборов понимаются операции над этими наборами как над множествами.
+1.Найти пересечение всех наборов полей.
+2.Найти сумму всех наборов полей как множество ключей отображения (fields), сопоставляющего конкретное поле набору id объектов, его содержащих.
+3.Если разность между найденными суммой и пересечением есть пустое множество, то схемы идентичны и данные зачитываются без каких либо изменений.
+4.Если же схемы не идентичны, то
+	1.путем обхода полученной суммы множеств получаем отображение, сопоставляющее имени поля набор полей с этим именем из всех таблиц.(список конфликтов)
+	2.Далее для каждого objid и его схемы выполняется следующий алгоритм:
+		1.Находится разность между суммой наборов полей и набором полей, соответствующим определенному objid.
+		2.Выполняется поиск каждого уникального имени поля из этой разности в списке конфликтов.
+			1.Если этому имени поля соответствует одно единственное поле, то конфликтов нет
+			и в этом случае поле попадает в список предназначенных для добавления в таблицу.
+			2.Если же в списке конфликтов этому имени поля соответствует более одного поля, то конфликт имеет место.
+			В этом случае
+				1.для каждого поля в списке
+					1.определяется (при помощи fields) набор объектов, его содержащих.
+					2.если objid из этого набора равен objid обрабатываемого объекта, то соответствующее поле переименовывается.
+					3.если же objid указывает на другой объект, то в набор добавляется новое поле соответствующего типа, имя которого
+					получается добавлением строки _[objid.hashCode] к имени поля.
+
+Сложность решения "влоб" N(N-1)/2*N*N ~ O(N^4), сложность приведенного алгоритма O(N^2) в обмен на необходимость считать хэши.
+ */
 
 class DataReader {
 
@@ -17,14 +43,13 @@ class DataReader {
     val schemaDDL = Files.readAllBytes(Paths.get(schemaPath)).map(_.toChar).mkString
     val schema = StructType.fromDDL(schemaDDL)
     val fldSet = new mutable.HashSet[StructField]() ++= schema.fields
-    objectsId += objId
     fieldSets.put(objId, fldSet)
   }
 
   def readAll() : DataFrame = {
     if (processSchema()) {
       val frames = new ArrayBuffer[DataFrame]()
-      for (objid <- objectsId) {
+      for (objid <- fieldSets.keySet) {
         val df = Spark.spark.read.parquet(objid)
         frames += normalizeDataframe(objid, df)
       }
@@ -37,22 +62,8 @@ class DataReader {
       //Если схемы не отличаются
       //То все фреймы зачитываются в 1 без каких либо
       //изменений
-      Spark.spark.read.parquet(objectsId.toList: _*)
+      Spark.spark.read.parquet(fieldSets.keySet.toList: _*)
     }
-  }
-
-  private def processSchema() : Boolean = {
-    toRename.clear()
-    toAppend.clear()
-    mapFieldsToObjects()
-    val sum = getSetSum()
-    val isec = getSetIntersection()
-    val difference = sum.diff(isec)
-    if (!difference.isEmpty){
-      collectInfo(difference)
-      true
-    }
-    else false
   }
 
   private def normalizeDataframe(objId:String, df:DataFrame) : DataFrame = {
@@ -69,117 +80,94 @@ class DataReader {
     newDf.select(sortedNames.head, sortedNames.tail: _*)
   }
 
-  private def mapFieldsToObjects() : Unit = {
-    val iter = fieldSets.iterator
-    while (iter.hasNext){
-      val p = iter.next()
-      val objid = p._1
-      for (f <- p._2){
-        fieldsToObjects.put(f, objid)
+  //Возвращает true если хотя бы 2 схемы имеют отличия и необходим процесс сравнения
+  //На выходе одновременно получаем сумму множеств полей,
+  //отображение поле - набор объектов и результат поиска отличия в схемах
+  private def prepareSum() : Boolean = {
+    var isec = fieldSets.head._2
+    val iter1 = fieldSets.iterator
+    while (iter1.hasNext) {
+      val p = iter1.next()
+      val fields = p._2
+      isec = isec.intersect(fields)
+      val iter2 = fields.iterator
+      while (iter2.hasNext) {
+        val f = iter2.next()
+        val objids = fieldsSum.get(f)
+        if (objids.isDefined) objids.get += p._1
+        else fieldsSum.put(f, new mutable.HashSet[String]() += p._1)
       }
     }
+    !fieldsSum.keySet.diff(isec).isEmpty
   }
 
-  private def getSetSum() : HashSet[StructField] = {
-    var sum = new mutable.HashSet[StructField]()
-    for (s <- fieldSets){
-      sum = sum ++= s._2
-    }
-    sum
-  }
-
-  private def getSetIntersection() : HashSet[StructField] = {
-    var isec = new HashSet[StructField]()
-    val iter = fieldSets.iterator
-    if (iter.hasNext) {
-      isec = fieldSets.iterator.next()._2
+  private def processSchema() : Boolean = {
+    toRename.clear()
+    toAppend.clear()
+    if (prepareSum()) {
+      registerAllConflicts()
+      val resultSchema = fieldsSum.keySet
+      val iter = fieldSets.iterator
       while (iter.hasNext) {
-        isec = isec intersect iter.next()._2
+        val p = iter.next()
+        val diff = resultSchema.diff(p._2)
+        mergeSchema(p._1, p._2, diff)
       }
+      true
     }
-    isec
+    else false
   }
 
-  private def checkFieldByName(fields:mutable.HashSet[StructField], name:String) : Boolean = {
-    var result = false
-    val iter = fields.iterator
-    while (iter.hasNext){
-      val f = iter.next()
-      if (f.name.equals(name)){
-        result = true
-      }
+  private def registerAllConflicts() : Unit = {
+    conflicts.clear()
+    val sum = fieldsSum.keySet
+    for (field <- sum) {
+      val p = conflicts.get(field.name)
+      if (p.isDefined) p.get += field
+      else conflicts.put(field.name, new HashSet[StructField]() += field)
     }
-    result
   }
 
-  private def resolveOneConflict(dif:mutable.HashSet[StructField], fieldName:String) : ArrayBuffer[StructField] = {
-    val result = new ArrayBuffer[StructField]()
-    val typesCount = new HashSet[StructField]()
-    val iter = dif.iterator
-    while (iter.hasNext){
-      val fld = iter.next()
-      if (fld.name.equals(fieldName)){
-        val conflictObjid = fieldsToObjects.get(fld)
-        result += new StructField(fld.name + "_" + conflictObjid.hashCode.toString, fld.dataType, true)
-        typesCount += fld
-      }
-    }
-    if (typesCount.size > 1) result
-    else new ArrayBuffer[StructField]() += typesCount.head
-  }
+  private def mergeSchema(objid:String,
+                          objFields:mutable.HashSet[StructField],
+                          diff:collection.Set[StructField]) : Unit = {
+    val rename = new ArrayBuffer[String]()
+    val renamedAppend = new ArrayBuffer[StructField]()
+    var append = new ArrayBuffer[StructField]()
 
-  private def resolveConflits(dif:mutable.HashSet[StructField], toAppend:HashSet[String]) : ArrayBuffer[StructField] = {
-    val result = new ArrayBuffer[StructField]()
-    for (name <- toAppend){
-      result ++= resolveOneConflict(dif, name)
-    }
-    result
-  }
+    //Получаем список имен недостающих колонок
+    val missingNames = new mutable.HashSet[String]()
+    for (field <- diff)
+      missingNames += field.name
 
-  private def collectInfo(dif:mutable.HashSet[StructField]) : Unit = {
-
-    for (objid <- objectsId) {
-      val rename = new HashSet[String]()
-      val renamedAppend = new ArrayBuffer[StructField]()
-      var append = new HashSet[String]()
-      val objFields = fieldSets.get(objid).get
-      val iter = dif.iterator
-      while (iter.hasNext) {
-        val f = iter.next()
-        if (!objFields.contains(f)){
-          //Если поля с таким именем и типом не нашлось
-          //то возможно 2 варианта
-          if (checkFieldByName(objFields, f.name)){
-            //Если существует поле с таким именем, но другим типом, то такая ситуация называется конфликтом
-            //В этом случае поле должно быть переименовано
-            rename += f.name
-            //К тому же в набор renamedAppend должно быть добавлено
-            //соответствующее поле объекта, вступившего в конфликт
-            val conflictObjid = fieldsToObjects.get(f)
-            renamedAppend += new StructField(f.name + "_" + conflictObjid.hashCode.toString, f.dataType, true)
-          }
-          else{
-            //Если же не найдено соответствия даже по имени,
-            //то такой столбец надо добавить
-            append += f.name
+    for (columnName <- missingNames){
+      val ci = conflicts.get(columnName)
+      if (ci.isDefined && ci.get.size > 1){
+        //Если же конфликты есть, то необходимо добавить все переименованные колонки из гругих объектов
+        //Если же текушая схема сама участвует в конфликте, то соответствующий столбец должен быть переименован
+        for (cf <- ci.get){
+          for (oi <- fieldsSum.get(cf).get){
+            if (!oi.equals(objid)){
+              val newName = columnName + "_" + oi.hashCode
+              renamedAppend += StructField(newName, cf.dataType, true)
+            }
+            else rename += columnName
           }
         }
       }
-      //Объект может добавить поле, по которому вступают в конфликт
-      //иные объекты. Потому необходима проверка новых колонок на участие в
-      //конфликтах и переименование при необходимости
-      val resolved = resolveConflits(dif, append)
-      toRename.put(objid, rename)
-      toAppend.put(objid, resolved ++= renamedAppend)
+      else{
+        //Если это поле не вступает в конфликт ни по одной паре таблиц,
+        //то просто добавляем его во фрейм
+        append += ci.get.head
+      }
     }
+    toRename.put(objid, rename)
+    toAppend.put(objid, append ++= renamedAppend)
   }
 
-  def getFieldsToRename(objid:String) : Option[HashSet[String]] = toRename.get(objid)
-  def getFieldsToAppend(objid:String) : Option[ArrayBuffer[StructField]] = toAppend.get(objid)
-
   private val fieldSets = new HashMap[String, mutable.HashSet[StructField]]()
-  private val objectsId = new mutable.HashSet[String]()
-  private val toRename = new mutable.HashMap[String, mutable.HashSet[String]]()
+  private val fieldsSum = new HashMap[StructField, mutable.HashSet[String]]
+  private val toRename = new mutable.HashMap[String, mutable.ArrayBuffer[String]]()
   private val toAppend = new mutable.HashMap[String, ArrayBuffer[StructField]]()
-  private val fieldsToObjects = new IdentityHashMap[StructField, String]()
+  private val conflicts = new HashMap[String, HashSet[StructField]]()
 }

@@ -137,6 +137,7 @@ object Main {
     val obj4 = "/home/test/Documents/5task/data/data4/"
     val obj5 = "/home/test/Documents/5task/data/data5/"
 
+
     val sp = new DataReader()
     sp.addSchema(obj1)
     sp.addSchema(obj2)
@@ -197,7 +198,9 @@ object Main {
     val df1 = Spark.spark.createDataFrame(Spark.spark.sparkContext.parallelize(data1), schema1)
     df1.registerTempTable("data")
     val sqlQuery = "select id,concat_ws(' ', collect_list(registeryear)) as registeryear, concat_ws(' ', collect_list(name)),concat_ws(' ', collect_list(surname)),concat_ws(' ', collect_list(bornyear)) from data group by id"
-    df1.sqlContext.sql(sqlQuery).show()
+    val df2 = df1.sqlContext.sql(sqlQuery)
+    df2.show()
+    df2.printSchema()
   }
 
   def printParquetTest() : Unit = {
@@ -210,11 +213,12 @@ object Main {
 
     SystemSettings.Init()
 
-    val omdsReadCmdline = "ds=tds actual_time=false address=_time_range#1572555600000-1572642000000/_year#2019/**/_department_num#4/ field=well_num op=# value=73 metrics=address#pad_num#deposit#_time_preprocess"
+    val omdsReadCmdline = "ds=tds actual_time=false address=_time_range#1572555600000-1572642000000/_year#2019/**/_department_num#4/ filter=well_num#73 metrics=address#pad_num#deposit#_time_preprocess tws=1572555600 twf=1612873862"
     val omdsread: OmdsRead = new OmdsRead(SimpleQuery(omdsReadCmdline), new MockPluginUtils(Spark.spark))
     val df = omdsread.transform(Spark.spark.emptyDataFrame)
     df.show()
 
+    //sqlGroupTest()
     //sqlGroupTest()
     //aggTest()
     //val tds:String = "/home/test/smalldata/"

@@ -16,10 +16,10 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
   private var tdsPath:String = ""
   private var actualTime:Boolean = false
   private var address:String = ""
-  private var field:String = ""
-  private var operation:String = ""
-  private var value:String = ""
+  private var filter:String = ""
   private val metrics:ArrayBuffer[String] = new ArrayBuffer[String]()
+  private var startTime:String = ""
+  private var endTime:String = ""
   private final val leafLenght = 8
 
   parseArguments(query.args)
@@ -29,9 +29,12 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
     val input = readData(tdsPath, address)
     val aggInput = aggByName(input, "_time")
     if (aggInput.count() > 0){
-      if (!field.isEmpty && !operation.isEmpty && !value.isEmpty){
-        var filteredFrame = filterData(aggInput, field, operation, value)
+      if (!filter.isEmpty){
+        var filteredFrame = filterData(aggInput, filter)
         if (filteredFrame.count() > 0){
+          if (!startTime.isEmpty && !endTime.isEmpty) {
+            filteredFrame = applyTimeRange(filteredFrame)
+          }
           if (actualTime)
             filteredFrame = updateTime(filteredFrame)
           result = addPartitionsColumns(filteredFrame.select("_time", metrics: _*))
@@ -66,20 +69,23 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
     val addr = getKeyword("address")
     if (addr.isDefined)
       address = addr.get.replaceAll("#", "=")
-    val fd = getKeyword("field")
+
+    val fd = getKeyword("filter")
     if (fd.isDefined)
-      field = fd.get
-    val op = getKeyword("op")
-    if (op.isDefined)
-      operation = op.get
-    val v = getKeyword("value")
-    if (v.isDefined)
-      value = v.get
+      filter = fd.get
+
     val ms = getKeyword("metrics")
     if (ms.isDefined){
       metrics.appendAll(ms.get.split("#"))
-      metrics += field
+      metrics += filter.split("#").head
     }
+
+    val tws = getKeyword("tws")
+    if (tws.isDefined)
+      startTime = tws.get
+    val twf = getKeyword("twf")
+    if (twf.isDefined)
+      endTime = twf.get
   }
 
   def readData(tds:String, addr:String) : DataFrame = {
@@ -136,11 +142,21 @@ class OmdsRead(query: SimpleQuery, utils: PluginUtils) extends PluginCommand(que
     df.sqlContext.sql(aggQuery.toString())
   }
 
-  def filterData(frame:DataFrame, field:String, op:String, value:String) : DataFrame = {
-    val operation = op.replaceAll("#", "=")
-    val sb:StringBuilder = new StringBuilder()
-    val sqlExp = sb.append(field).append(" ").append(operation).append(" ").append(value).toString
-    frame.filter(sqlExp)
+  def filterData(frame:DataFrame, filter:String) : DataFrame = {
+    val operation = filter.replaceAll("#", "=")
+    frame.filter(operation)
+  }
+
+  def applyTimeRange(frame:DataFrame) : DataFrame = {
+    frame.registerTempTable("data")
+    val sb = new StringBuilder()
+    sb.append("select * from data where _time > to_timestamp(")
+    sb.append(startTime)
+    sb.append(") and _time < to_timestamp(")
+    sb.append(endTime)
+    sb.append(")")
+    val q = sb.toString()
+    frame.sqlContext.sql(q)
   }
 
   def updateTime(frame:DataFrame) : DataFrame = {
